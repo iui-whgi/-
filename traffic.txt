@@ -1,0 +1,600 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+####################################################################
+# 프로그램명 : hough_drive_c1.py
+# 작 성 자 : K.G.
+# 생 성 일 : 2024년 08월 16일
+# 본 프로그램은 상업 라이센스에 의해 제공되므로 무단 배포 및 상업적 이용을 금합니다.
+####################################################################
+
+import os
+import signal
+import sys
+from math import *
+import cv2
+import math
+import numpy as np
+import rospkg
+import rospy
+import time
+from cv_bridge import CvBridge
+from sensor_msgs.msg import Image
+from std_msgs.msg import Int32MultiArray
+from xycar_msgs.msg import xycar_motor
+
+DEBUG_SAVE_PATH = '/home/pi/xycar_ws/src/study/auto_drive/src/traffic_img'
+if not os.path.exists(DEBUG_SAVE_PATH):
+    os.makedirs(DEBUG_SAVE_PATH)
+
+debug_counter = 1
+
+def signal_handler(sig, frame):
+    import time
+    time.sleep(3)
+    os.system('killall -9 python rosout')
+    sys.exit(0)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+
+image = np.empty(shape=[0])
+bridge = CvBridge()
+motor = None
+Width = 320
+Height = 240
+Offset = 160
+Gap = 60
+
+Offset2 = 10
+Gap2 = 100
+Width2 = 90
+
+cam = False
+cam_debug = True
+
+sub_f = 0
+time_c = 0
+
+#H:color(0~360), S : 채도(진한 상태 100, 연한 상태 0), V: 명도(흰100, 검0)
+
+# define range of color in HSV
+lower_red = np.array([0, 150, 150])
+upper_red = np.array([10, 200, 200])
+
+lower_red2 = np.array([175, 100, 100])
+upper_red2 = np.array([180, 255, 255])
+
+# Yellow color range in HSV
+lower_yellow = np.array([15, 150, 150])
+upper_yellow = np.array([35, 255, 255])
+
+lower_green = np.array([35, 150, 150])
+upper_green = np.array([85, 200, 200])
+
+#Flag color
+red_detected = False
+green_detected = False
+yellow_detected = False
+
+def img_callback(data):
+    global image
+    global sub_f
+    global time_c
+
+    sub_f += 1
+    if time.time() - time_c > 1:
+        time_c = time.time()
+        sub_f = 0
+
+    image = bridge.imgmsg_to_cv2(data, "bgr8")
+
+def ultra_callback(data):
+    global ultra_msg
+    ultra_msg = data.data
+
+
+# publish xycar_motor msg
+def drive(Angle, Speed):
+    global motor
+
+    motor_msg = xycar_motor()
+    motor_msg.angle = Angle
+    motor_msg.speed = Speed
+
+    motor.publish(motor_msg)
+
+# draw lines
+def draw_lines(img, lines):
+    global Offset
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        img = cv2.line(img, (x1, y1 + Offset), (x2, y2 + Offset), (0, 255, 0), 2)
+    return img
+
+
+# draw rectangle
+def draw_rectangle(img, lpos, rpos, offset=0):
+    center = (lpos + rpos) / 2
+    center = int(center)
+
+    cv2.rectangle(img, (lpos - 2, 7 + offset),
+                  (lpos + 2, 12 + offset),
+                  (0, 0, 0), 2)
+    cv2.rectangle(img, (rpos - 2, 7 + offset),
+                  (rpos + 2, 12 + offset),
+                  (255, 0, 0), 2)
+    cv2.rectangle(img, (center - 2, 7 + offset),
+                  (center + 2, 12 + offset),
+                  (0, 255, 0), 2)
+    cv2.rectangle(img, (157, 7 + offset),
+                  (162, 12 + offset),
+                  (0, 0, 255), 2)
+    return img
+
+
+# left lines, right lines
+def divide_left_right(lines):
+    global Width
+
+    low_slope_threshold = 0
+    high_slope_threshold = 20
+
+    # calculate slope & filtering with threshold
+    slopes = []
+    new_lines = []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+
+        if x2 - x1 == 0:
+            slope = 0
+        else:
+            slope = float(y2 - y1) / float(x2 - x1)
+
+        if low_slope_threshold < abs(slope) < high_slope_threshold:
+            slopes.append(slope)
+            new_lines.append(line[0])
+
+    # divide lines left to right
+    left_lines = []
+    right_lines = []
+    th = -10
+
+    for j in range(len(slopes)):
+        Line = new_lines[j]
+        slope = slopes[j]
+
+        x1, y1, x2, y2 = Line
+
+        if (slope < 0) and (x2 < Width / 2 - th):
+            left_lines.append([Line.tolist()])
+        elif (slope > 0) and (x1 > Width / 2 + th):
+            right_lines.append([Line.tolist()])
+
+    return left_lines, right_lines
+
+
+# get average m, b of line, sum of x, y, mget lpos, rpos
+def get_line_pos(img, lines, left=False, right=False):
+    global Width, Height
+    global Offset, Gap, cam_debug
+
+    x_sum = 0.0
+    y_sum = 0.0
+    m_sum = 0.0
+
+    size = len(lines)
+
+    m = 0
+    b = 0
+
+    if size != 0:
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+
+            x_sum += x1 + x2
+            y_sum += y1 + y2
+            m_sum += float(y2 - y1) / float(x2 - x1)
+
+        x_avg = x_sum / (size * 2)
+        y_avg = y_sum / (size * 2)
+
+        m = m_sum / size
+        b = y_avg - m * x_avg
+
+    if m == 0 and b == 0:
+        if left:
+            pos = 0
+        elif right:
+            pos = Width
+    else:
+        y = Gap / 2
+
+        pos = (y - b) / m
+
+        if cam_debug:
+            b += Offset
+            xs = (Height - b) / float(m)
+            xe = ((Height / 2) - b) / float(m)
+
+            cv2.line(img, (int(xs), int(Height)), (int(xe), int(Height / 2)), (255, 0, 0), 3)
+
+    return img, int(pos)
+
+def stop(all_lines, flag, line_count, stop_time):
+    line_len = all_lines
+    print("all_lilnes", line_len)
+
+    # 주행 시작
+    if (line_count == 0) and (line_len > 30):
+        flag = 1
+        line_count = 1
+        stop_time = time.time() + 10.5
+        print("Flag up for first time, stop time: ", stop_time)
+
+    elif line_count == 1 and line_len > 30:
+        # 두 번째 바퀴를 돌고 멈추는 조건
+        flag = 0
+        line_count = 2
+        stop_time = time.time() + 10.5
+        print("Flag up for the second time, stop time: ", stop_time)
+    return line_count, flag, stop_time
+
+def create_color_masks(hsv):
+    global lower_red, upper_red, lower_red2, upper_red2
+    global lower_green, upper_green
+    global lower_yellow, upper_yellow
+
+    # Create color masks
+    red_mask1 = cv2.inRange(hsv, lower_red, upper_red)
+    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = cv2.bitwise_or(red_mask1, red_mask2)
+    green_mask = cv2.inRange(hsv, lower_green, upper_green)
+    yellow_mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
+
+    return red_mask, green_mask, yellow_mask
+
+# show image and return lpos, rpos
+def process_image(frame, w_time, stage):
+    global Width
+    global Offset, Gap
+    global cam, cam_debug, img
+
+    # 초기화
+    lpos, rpos, white_stop = (Width / 2, Width / 2, 0)
+    red_mask = green_mask = yellow_mask = None
+
+    try:
+        # Convert the image to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        roi = gray[Offset: Offset + Gap, 0: Width]
+
+        # Apply Gaussian blur
+        kernel_size = 5
+        standard_deviation_x = 3  # Kernel standard deviation along X-axis
+        blur_gray = cv2.GaussianBlur(roi, (kernel_size, kernel_size), standard_deviation_x)
+
+        # Initialize white stop counter
+        white_stop = 0
+
+        if w_time:
+            # Process stop region
+            roi_stop = gray[Offset: Offset + Gap, int(Width / 2) - 80: int(Width / 2) + 30]
+            blur_stop = cv2.GaussianBlur(roi_stop, ksize=(5, 5), sigmaX=0)
+            edged_stop = cv2.Canny(blur_stop, 10, 250)
+            white_stop = np.sum(edged_stop == 255)
+
+        # Canny edge detection
+        low_threshold = 170
+        high_threshold = 200
+        edge_img = cv2.Canny(np.uint8(blur_gray), low_threshold, high_threshold, kernel_size)
+
+        # Hough Transform to detect lines
+        all_lines = cv2.HoughLinesP(edge_img, 1, math.pi / 180, 30, 30, 2)
+
+        if cam:
+            #cv2.imshow('calibration', frame)
+            pass
+
+        # Divide detected lines into left and right
+        if all_lines is None:
+            return (Width) / 2, (Width) / 2, white_stop, red_mask, green_mask, yellow_mask
+
+        left_lines, right_lines = divide_left_right(all_lines)
+
+        # Get positions of lines
+        frame, lpos = get_line_pos(frame, left_lines, left=True)
+        frame, rpos = get_line_pos(frame, right_lines, right=True)
+
+        # Draw lines and rectangles if in debug mode
+        if cam_debug:
+            frame = draw_lines(frame, left_lines)
+            frame = draw_lines(frame, right_lines)
+            frame = cv2.line(frame, (115, 117), (205, 117), (0, 255, 255), 2)
+            frame = draw_rectangle(frame, lpos, rpos, offset=Offset)
+            frame = cv2.rectangle(frame, (0, Offset), (int(Width), Offset + Gap), (255, 202, 204), 2)
+            frame = cv2.rectangle(frame, (int(Width / 2) - 80, Offset), (int(Width / 2) + 30, Offset + Gap),
+                                  (200, 150, 100), 2)
+
+        # Convert frame to HSV color space
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Apply color masks
+        red_mask, green_mask, yellow_mask = create_color_masks(hsv)
+
+        # Draw colored regions for debugging
+        if cam_debug:
+            filename = os.path.join(DEBUG_SAVE_PATH, f'image_{debug_counter}.png')
+            cv2.imwrite(filename, frame)
+
+        if (stage == 2):
+            return lpos, rpos, white_stop, red_mask, green_mask, yellow_mask
+        else:
+            return lpos, rpos, white_stop, red_mask, green_mask, yellow_mask
+
+    except Exception as e:
+        print(f"An error occurred in process_image: {e}")
+        # Return default values in case of error
+        return (Width) / 2, (Width) / 2, 0, None, None, None
+
+
+def draw_steer(steer_angle):
+    global Width, Height, img
+
+    if img is None or img.size == 0:
+        return
+
+    arrow = cv2.imread('/home/pi/xycar_ws/src/study/auto_drive/src/steer_arrow.png')
+
+    if arrow is None:
+        print("error:steer_arrow img empty")
+        return
+
+    origin_Height = arrow.shape[0]
+    origin_Width = arrow.shape[1]
+    steer_wheel_center = origin_Height * 0.74
+    arrow_Height = Height / 2
+    arrow_Width = (arrow_Height * 462) / 728
+    arrow_Height = int(arrow_Height)
+    arrow_Width = int(arrow_Width)
+
+    matrix = cv2.getRotationMatrix2D((origin_Width / 2, steer_wheel_center), (-steer_angle) * 1.5, 0.7)
+    arrow = cv2.warpAffine(arrow, matrix, (origin_Width + 60, origin_Height))
+    arrow = cv2.resize(arrow, dsize=(arrow_Width, arrow_Height), interpolation=cv2.INTER_AREA)
+
+    gray_arrow = cv2.cvtColor(arrow, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray_arrow, 1, 255, cv2.THRESH_BINARY_INV)
+
+    if Height - arrow_Height < 0 or Width / 2 - arrow_Width / 2 < 0 or Width / 2 + arrow_Width / 2 > Width:
+        print("오류: roi 범위가 이미지 크기를 벗어났습니다.")
+        return
+
+    arrow_roi = img[arrow_Height: int(Height), int(Width / 2 - arrow_Width / 2): int(Width / 2 + arrow_Width / 2)]
+    arrow_roi = cv2.add(arrow, arrow_roi, mask=mask)
+    res = cv2.add(arrow_roi, arrow)
+    img[int(Height - arrow_Height): int(Height),
+    int(Width / 2 - arrow_Width / 2): int(Width / 2 + arrow_Width / 2)] = res
+
+def pid_angle(ITerm, error, b_angle, b_error, Cnt):
+    angle = 0
+    Kp = 0.925  # 0.5 good / if Kp high -> loss decrease+faster response but incur overshoot
+    Ki = 0.00065  # 0.0001 good #0.0002 / if Ki high
+    # -> accumulated loss increase faster+faster response but incur overshoot
+    Kd = 0.0925  # 1.0 good #2.0/ decrease the vibration
+    # if Kd high -> decrease overshoot but when the signal changes rapidly
+    # it can make the system destroy
+    dt = 1
+
+    PTerm = Kp * error
+    ITerm += Ki * error * dt
+    derror = error - b_error
+    DTerm = Kd * (derror / dt)
+    # angle = PTerm + ITerm + DTerm
+    angle = PTerm + DTerm
+
+    return angle, ITerm
+
+def detect_color(mask, draw_img):
+    return cv2.bitwise_and(draw_img, draw_img, mask=mask)
+
+def update_stage_based_on_color(red_mask, green_mask, yellow_mask, stage):
+    global red_detected, green_detected, yellow_detected
+
+    if stage == 0:
+        if red_mask is not None and cv2.countNonZero(red_mask) > 1000:
+            if not red_detected:
+                print("Red light detected")
+                red_detected = True
+            green_detected = False
+            yellow_detected = False
+        elif yellow_mask is not None and cv2.countNonZero(yellow_mask) > 1000:
+            if not yellow_detected:
+                print("Yellow light detected")
+                yellow_detected = True
+            red_detected = False
+            green_detected = False
+        elif green_mask is not None and cv2.countNonZero(green_mask) > 1000:
+            if not green_detected:
+                print("Green light detected")
+                green_detected = True
+                stage = 1
+            red_detected = False
+            yellow_detected = False
+
+    return stage
+
+def start():
+    global motor
+    global image
+    global Width, Height
+    global img
+    cam_record = False
+    debug_mode = True  # Activated debugging mode
+    save_debug_image = True
+
+    rospy.init_node('auto_drive')
+    motor = rospy.Publisher('xycar_motor', xycar_motor, queue_size=1)
+
+    rospy.Subscriber("xycar_ultrasonic", Int32MultiArray, ultra_callback)
+    image_sub = rospy.Subscriber("/usb_cam/image_raw/", Image, img_callback)
+    print("---------- Xycar C1 HD v1.0 ----------")
+    time.sleep(3)
+
+    stage = 0
+    t_check = time.time()
+    f_n = 0
+    p_angle = 0
+    flag = 0
+    line_count = 0
+    avoid_time = time.time() + 3.8
+    before_start = time.time() + 1
+    turn_right = time.time()
+    stop_time = time.time() + 16 + 1
+    speed_time = 0
+    b_angle = 0
+    b_error = 0
+    ITerm = 0
+    Opt = 0 # obstacle
+    Cnt = 0
+    speed = 0
+    w_time = False
+    stage_time = 0
+
+    if cam_record:
+        fourcc = cv2.VideoWriter_fourcc(*'DIVX')
+        path = '/home/pi/xycar_ws/src/base/cam_record'
+        out = cv2.VideoWriter(os.path.join(path, 'test.avi'), fourcc, 25.0, (Width, Height))
+
+    while not rospy.is_shutdown():
+
+        while not image.size == (Width * Height * 3):
+            continue
+
+        if time.time() < before_start:
+            drive(0, 0)
+            continue
+
+        f_n += 1
+        if (time.time() - t_check) > 1:
+            t_check = time.time()
+            f_n = 0
+        if cam_record:
+            out.write(image)
+        draw_img = image.copy()
+
+        try:
+            lpos, rpos, white_stop, red_mask, green_mask, yellow_mask = process_image(draw_img, w_time, stage)
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            lpos, rpos, white_stop, red_mask, green_mask, yellow_mask = process_image(draw_img, w_time, stage)
+
+        stage = update_stage_based_on_color(red_mask, green_mask, yellow_mask, stage)
+
+        # debugging image save
+        if debug_mode and save_debug_image:
+            filename = os.path.join(DEBUG_SAVE_PATH, f'image_{debug_counter}.png')
+            cv2.imwrite(filename, draw_img)
+
+        # Handle traffic lights and stopping
+        if stage == 0:
+            if red_mask is not None and cv2.countNonZero(red_mask) > 1000:
+                print("빨간 불 인식")
+                max_time_end = time.time() + 3
+                while time.time() < max_time_end:
+                    drive(0, 0)  # Stop the car while waiting
+                continue  # Continue to the next iteration to check for green light
+            elif yellow_mask is not None and cv2.countNonZero(yellow_mask) > 1000:
+                print("노란 불 인식")
+                max_time_end = time.time() + 3
+                while time.time() < max_time_end:
+                    drive(0, 0)  # Stop the car while waiting
+                continue  # Continue to the next iteration to check for green light
+
+        # Start driving if the green light is detected
+        if stage == 0 and green_mask is not None and cv2.countNonZero(green_mask) > 1000:
+            print("초록 불 인식, 주행 재개")
+            stage = 1  # Move to the next stage or state
+            speed = 23  # Set a default driving speed
+
+        # Rest of the driving and control logic
+        if (time.time() > stop_time):
+            w_time = True
+        if w_time:
+            if (white_stop >= 400):
+                line_count += 1
+                stop_time = time.time() + 11.5
+                w_time = False
+
+        if (line_count == 2):
+            drive(0, 0)
+            line_count = 0
+
+        if stage == 1 and time.time() > stage_time:
+            stage = 2
+            max_time_end = time.time() + 0.7
+            while True:
+                drive(100, 15)
+                if time.time() > max_time_end:
+                    break
+            max_time_end = time.time() + 0.95
+            while True:
+                drive(-100, 8)
+                if time.time() > max_time_end:
+                    break
+            speed_time = time.time() + 1.5
+
+        diff = rpos - lpos
+
+        if diff > 135 and diff < 142:
+            print("straight")
+        else:
+            print("curve")
+
+        hsv = cv2.cvtColor(draw_img, cv2.COLOR_BGR2GRAY)
+
+        if (lpos == 0):
+            lpos = rpos - 130
+        if (rpos > lpos + 145):
+            rpos = lpos + 130
+
+        center = (lpos + rpos) / 2
+
+        error = (center - Width / 2)
+        angle, ITerm = pid_angle(ITerm, error, b_angle, b_error, Cnt)
+
+        if stage == 0:
+            drive(angle, speed)
+
+        if stage == 1:
+            if green_mask is not None and cv2.countNonZero(green_mask) > 1000:
+                print("초록 불 인식, 주행 재개")
+                max_time_end = time.time() + 3
+                while time.time() < max_time_end:
+                    if diff > 135 and diff < 142:
+                        print("straight")
+                    else:
+                        print("curve")
+                    if time.time() > max_time_end:
+                        break
+
+        if (stage == 1 or time.time() < speed_time):
+            speed = 3.8
+        elif (stage == 0):
+            speed = 22
+        elif angle < -17.5 or angle > 17.5:
+            speed = 23
+        else:
+            speed = 30
+
+        if angle < -17 or angle > 17:
+            speed = 22
+        else:
+            speed = 30
+
+        drive(angle, speed)
+
+        b_angle = angle
+        b_error = error
+
+if __name__ == '__main__':
+    start()
